@@ -1,188 +1,152 @@
-"""Washout-thrust BTC bot for the make.fun 24h cbBTC race.
+"""Washout-thrust BTC race bot: buy the sharp dip-reversal, ride it with a trail.
 
-Idea: this market grinds down most of the day and pays only on the rare
-violent reversals. The bot sits in cash, waits for a washout (the price
-falls hard in 15 minutes), then buys the first strong recovery thrust
-after it. It never chases a rally that is already running, never holds
-through the grind, and cuts any trade that stalls.
+The bot sits in cash while the market grinds down and only buys when a real
+washout reverses: the worst 15-minute return over the last 45 bars is at most
+-85 bps and the current 15-minute return is back up at least +15 bps. It goes
+all in with the whole cash, one position at a time, and exits on a +120 bps
+take-profit, a -60 bps stop-loss, a 30 bps trailing stop below the best close
+since the fill, or a stall exit when the trade is still under +15 bps eight
+bars after the fill. After each exit it waits 30 bars before trading again.
+If nothing has traded by bar 1200 the entry softens to -60 / +10 bps so the
+bot still takes at least one trade and meets the race guardrail.
 
-Entry (long only, whole cash):
-  - a washout happened in the last 45 bars: some bar's 15-minute return
-    is below -85 bps, and
-  - this bar's 15-minute return is above +15 bps (the thrust is real).
-
-Exit (sell everything), whichever comes first:
-  - take profit at +120 bps over the fill,
-  - stop loss at -60 bps under the fill,
-  - trailing stop: 30 bps below the best close since the fill,
-  - stall: 8 bars after the fill the trade is still under +15 bps.
-
-If nothing has traded by bar 1200 the washout bar is lowered to -60 bps
-and the thrust bar to +10 bps, so the bot still takes at least one
-trade and meets the race guardrail instead of finishing flat.
-
-All arithmetic is integer basis points on the bar closes, so two runs
-agree byte for byte. No clock, no network, no randomness.
+All arithmetic is integer basis points on bar closes; no clock, no network,
+no randomness, so two runs on the same data produce identical orders.
 """
 
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-
 import makefun_bars
 
 SYMBOL = "CBBTC"
+SLIP_BPS = 100
 
-# Entry: washout depth (bps over 15 minutes), lookback window (bars),
-# and the recovery thrust (bps over 15 minutes) that confirms it.
 WASHOUT_BPS = 85
-WASHOUT_WINDOW = 45
 THRUST_BPS = 15
-
-# Exits, all in bps against the fill price unless noted.
+SOFT_BAR = 1200
+SOFT_WASHOUT_BPS = 60
+SOFT_THRUST_BPS = 10
 TAKE_PROFIT_BPS = 120
 STOP_LOSS_BPS = 60
 TRAIL_BPS = 30
 STALL_BARS = 8
-STALL_GAIN_BPS = 15
-
-# Bars to wait after an exit before a fresh entry.
+STALL_PROFIT_BPS = 15
 COOLDOWN_BARS = 30
-
-# Late-window fallback: if no trade has filled by this bar, soften the
-# entry bars so the bot still trades at least once.
-FALLBACK_BAR = 1200
-FALLBACK_WASHOUT_BPS = 60
-FALLBACK_THRUST_BPS = 10
-
-# Slippage cap on every order, in bps from the latest close.
-MAX_SLIPPAGE_BPS = 200
-
-# Bars of history needed before the first decision (washout window plus
-# the 15-minute returns it scans).
-WARMUP_BARS = 70
+LAST_ENTRY_BAR = 1380
+LOOKBACK_BARS = 45
+RETURN_BARS = 15
+MIN_HISTORY_BARS = 60
 
 
-def bps_move(new_price, old_price):
-    """Return of new_price over old_price in integer basis points."""
-    return (new_price - old_price) * 10000 // old_price
+class Trader:
+    """The bot's whole memory: closes seen, the open trade, and the cooldown."""
 
-
-class WashoutThrustBot:
-    """One-asset trend-catcher: cash until a washout plus a thrust."""
-
-    def __init__(self, state):
-        self.state = state
+    def __init__(self):
         self.closes = []
         self.entry_price = 0
-        self.entry_seq = 0
+        self.fill_seq = -1
         self.peak_close = 0
-        self.last_exit_seq = -10 ** 9
-        self.trades = 0
-        self.bought = False
+        self.cooldown_until = -1
+        self.round_trips = 0
 
-    def note_fills(self, batch):
-        """Fold this batch's fills into the trade record."""
+    def note_fill(self, batch):
+        """Fold this batch's fills in: a buy sets the entry, a sell closes it."""
         for fill in batch.get("fills", []):
-            if fill.get("symbol") != SYMBOL:
-                continue
-            if fill.get("status") != "filled":
+            if fill.get("symbol") != SYMBOL or fill.get("status") != "filled":
                 continue
             if fill.get("side") == "buy":
                 self.entry_price = int(fill["price"])
-                self.entry_seq = self.state.seq
-                self.peak_close = self.entry_price
-                self.bought = True
+                self.fill_seq = batch["seq"]
+                self.peak_close = self.closes[-1] if self.closes else self.entry_price
             elif fill.get("side") == "sell":
                 self.entry_price = 0
+                self.fill_seq = -1
                 self.peak_close = 0
+                self.round_trips += 1
+                self.cooldown_until = batch["seq"] + COOLDOWN_BARS
 
-    def washout_seen(self, washout_bps, window):
-        """True when some bar in the window fell washout_bps in 15 minutes."""
+    def worst_fifteen(self):
+        """The worst 15-bar return over the recent window, in basis points."""
         closes = self.closes
-        start = max(16, len(closes) - window)
+        worst = 0
+        start = max(RETURN_BARS, len(closes) - LOOKBACK_BARS)
         for j in range(start, len(closes)):
-            if bps_move(closes[j], closes[j - 15]) < -washout_bps:
-                return True
-        return False
+            ret = (closes[j] - closes[j - RETURN_BARS]) * 10000 // closes[j - RETURN_BARS]
+            if ret < worst:
+                worst = ret
+        return worst
 
-    def decide(self, batch):
-        """The orders for this batch, as shim order dicts."""
-        state = self.state
-        if state.warming_up:
-            return []
-        # Fills first: a fill can arrive on a batch that carries no bar,
-        # and the exit logic below needs the entry price it reports.
-        self.note_fills(batch)
-        bars = [b for b in batch.get("bars", []) if b.get("symbol") == SYMBOL]
-        if not bars:
-            return []
-        close = int(bars[0]["c"])
-        self.closes.append(close)
-        if len(self.closes) <= WARMUP_BARS:
-            return []
-        held = state.positions.get(SYMBOL)
-        holding = held is not None and held.qty > 0
-        if holding:
-            return self.exit_orders(state)
-        return self.entry_orders(state)
-
-    def entry_orders(self, state):
-        """Buy the whole cash on a washout plus a thrust, else nothing."""
-        if state.seq - self.last_exit_seq < COOLDOWN_BARS:
-            return []
+    def current_fifteen(self):
+        """The current 15-bar return, in basis points."""
         closes = self.closes
-        thrust_now = bps_move(closes[-1], closes[-16])
-        if self.trades == 0 and not self.bought and state.seq >= FALLBACK_BAR:
-            washout_bps = FALLBACK_WASHOUT_BPS
-            thrust_bps = FALLBACK_THRUST_BPS
-        else:
-            washout_bps = WASHOUT_BPS
-            thrust_bps = THRUST_BPS
-        if thrust_now <= thrust_bps:
-            return []
-        if not self.washout_seen(washout_bps, WASHOUT_WINDOW):
-            return []
-        spend = state.cash
-        room = state.weight_room(SYMBOL)
-        if room < spend:
-            spend = room
-        if spend < 1000000:
-            return []
-        return [{"side": "buy", "symbol": SYMBOL,
-                 "notional_quote_units": spend,
-                 "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+        return (closes[-1] - closes[-1 - RETURN_BARS]) * 10000 // closes[-1 - RETURN_BARS]
 
-    def exit_orders(self, state):
-        """Sell everything on take-profit, stop, trail or stall."""
-        held = state.positions[SYMBOL]
-        if self.entry_price <= 0 and held.qty > 0:
-            # Fill record missed (for instance a gap bar): recover the
-            # entry price from the position's cost, fees included.
-            self.entry_price = held.cost * 10 ** 7 // held.qty
-            self.peak_close = max(self.peak_close, self.entry_price)
-        close = self.closes[-1]
-        if close > self.peak_close:
-            self.peak_close = close
-        gain = bps_move(close, self.entry_price)
-        trail = bps_move(self.peak_close, close)
-        loss = -gain
-        age = state.seq - self.entry_seq
-        stalled = age >= STALL_BARS and gain < STALL_GAIN_BPS
-        if (gain >= TAKE_PROFIT_BPS or loss >= STOP_LOSS_BPS
-                or trail >= TRAIL_BPS or stalled):
-            self.last_exit_seq = state.seq
-            self.trades += 1
-            return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                     "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-        return []
+
+TRADER = Trader()
 
 
 def on_batch(state, batch):
-    if not hasattr(state, "bot"):
-        state.bot = WashoutThrustBot(state)
-    return state.bot.decide(batch)
+    TRADER.note_fill(batch)
+    if any(bar.get("symbol") == SYMBOL for bar in batch.get("bars", [])):
+        close = state.close(SYMBOL)
+        if close is not None:
+            TRADER.closes.append(close)
+    close = state.close(SYMBOL)
+    if close is None or state.warming_up:
+        return []
+
+    holding = state.positions.get(SYMBOL)
+    if holding is not None and holding.qty > 0:
+        if TRADER.entry_price <= 0:
+            return []
+        if close > TRADER.peak_close:
+            TRADER.peak_close = close
+        profit = (close - TRADER.entry_price) * 10000 // TRADER.entry_price
+        bars_held = state.seq - TRADER.fill_seq
+        trail_line = TRADER.peak_close - TRADER.peak_close * TRAIL_BPS // 10000
+        stalled = bars_held >= STALL_BARS and profit < STALL_PROFIT_BPS
+        if (
+            profit >= TAKE_PROFIT_BPS
+            or profit <= -STOP_LOSS_BPS
+            or close <= trail_line
+            or stalled
+        ):
+            return [
+                {
+                    "side": "sell",
+                    "symbol": SYMBOL,
+                    "qty": holding.qty,
+                    "max_slippage_bps": SLIP_BPS,
+                }
+            ]
+        return []
+
+    if (
+        state.seq < MIN_HISTORY_BARS
+        or state.seq > LAST_ENTRY_BAR
+        or state.seq < TRADER.cooldown_until
+        or len(TRADER.closes) <= RETURN_BARS
+        or state.cash <= 0
+    ):
+        return []
+
+    washout = WASHOUT_BPS
+    thrust = THRUST_BPS
+    if TRADER.round_trips == 0 and state.seq >= SOFT_BAR:
+        washout = SOFT_WASHOUT_BPS
+        thrust = SOFT_THRUST_BPS
+    if TRADER.worst_fifteen() <= -washout and TRADER.current_fifteen() >= thrust:
+        return [
+            {
+                "side": "buy",
+                "symbol": SYMBOL,
+                "notional_quote_units": state.cash,
+                "max_slippage_bps": SLIP_BPS,
+            }
+        ]
+    return []
 
 
 makefun_bars.run(on_batch)
